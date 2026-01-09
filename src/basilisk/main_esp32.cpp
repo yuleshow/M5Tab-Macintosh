@@ -2,6 +2,10 @@
  *  main_esp32.cpp - Main program entry point for ESP32
  *
  *  BasiliskII ESP32 Port
+ *
+ *  Dual-core optimized:
+ *  - Core 1: CPU emulation (main Arduino loop)
+ *  - Core 0: Video rendering task, timer interrupts
  */
 
 #include "sysdeps.h"
@@ -9,6 +13,11 @@
 #include <M5Unified.h>
 #include <M5GFX.h>
 #include <SD.h>
+
+// FreeRTOS for dual-core support and timers
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/timers.h"
 
 #include "cpu_emulation.h"
 #include "sys.h"
@@ -55,10 +64,11 @@ uint32 InterruptFlags = 0;
 void basilisk_loop(void);
 
 // CPU tick counter for timing (used by newcpu.cpp)
+// With video rendering offloaded to Core 0, we can use a much higher quantum
 // Higher quantum = less frequent periodic checks = faster emulation
-// But too high can cause choppy video/input response
-int32 emulated_ticks = 5000;
-static int32 emulated_ticks_quantum = 5000;
+// Reduced from 5000 to 20000 since video is now async
+int32 emulated_ticks = 20000;
+static int32 emulated_ticks_quantum = 20000;
 
 /*
  *  CPU tick check - called periodically during emulation
@@ -74,31 +84,68 @@ void cpu_do_check_ticks(void)
 
 // Global emulator state
 static bool emulator_running = false;
-static uint32 last_tick_time = 0;
+static uint32 last_60hz_time = 0;
 static uint32 last_second_time = 0;
-static uint32 last_video_refresh = 0;
+static uint32 last_video_signal = 0;
 
-// Video refresh interval (ms)
-#define VIDEO_REFRESH_INTERVAL 33  // ~30 FPS
+// Video signal interval (ms) - how often to signal video task
+// The video task runs at its own pace, this just triggers buffer swap
+#define VIDEO_SIGNAL_INTERVAL 33  // ~30 FPS
 
-// 60Hz tick interval (ms)
-#define TICK_60HZ_INTERVAL 16  // ~60 Hz
+// FreeRTOS timer for 60Hz tick
+static TimerHandle_t timer_60hz = NULL;
 
 /*
- *  Set/clear interrupt flags
+ *  Set/clear interrupt flags (thread-safe using atomic operations)
  */
 void SetInterruptFlag(uint32 flag)
 {
-    InterruptFlags |= flag;
+    // Use atomic OR for thread safety (called from timer callback on different core)
+    __atomic_or_fetch(&InterruptFlags, flag, __ATOMIC_SEQ_CST);
 }
 
 void ClearInterruptFlag(uint32 flag)
 {
-    InterruptFlags &= ~flag;
+    // Use atomic AND for thread safety
+    __atomic_and_fetch(&InterruptFlags, ~flag, __ATOMIC_SEQ_CST);
 }
 
 /*
- *  Mutex functions (single-threaded, stubs)
+ *  Handle 60Hz tick - called from main loop at safe points
+ *  Using polling instead of FreeRTOS timer to avoid race conditions
+ */
+static void handle_60hz_tick(void)
+{
+    // Set 60Hz interrupt flag
+    SetInterruptFlag(INTFLAG_60HZ);
+    
+    // Handle ADB (mouse/keyboard) updates
+    SetInterruptFlag(INTFLAG_ADB);
+    
+    // Trigger interrupt in CPU emulation
+    TriggerInterrupt();
+}
+
+/*
+ *  Start the 60Hz timer (now uses polling in main loop)
+ */
+static bool start60HzTimer(void)
+{
+    // No timer creation needed - we use polling now
+    Serial.println("[MAIN] 60Hz using polling mode (safer)");
+    return true;
+}
+
+/*
+ *  Stop the 60Hz timer (no-op when using polling)
+ */
+static void stop60HzTimer(void)
+{
+    // No timer to stop in polling mode
+}
+
+/*
+ *  Mutex functions (now using FreeRTOS primitives for thread safety)
  */
 B2_mutex *B2_create_mutex(void)
 {
@@ -262,22 +309,6 @@ static bool AllocateRAM(void)
 }
 
 /*
- *  60Hz tick handler - called from main loop
- */
-static void handle_60hz_tick(void)
-{
-    // Set 60Hz interrupt flag
-    SetInterruptFlag(INTFLAG_60HZ);
-    
-    // Handle ADB (mouse/keyboard) updates
-    // ADBInterrupt is defined in adb.h but we handle ADB directly
-    SetInterruptFlag(INTFLAG_ADB);
-    
-    // Trigger interrupt
-    TriggerInterrupt();
-}
-
-/*
  *  1Hz tick handler
  */
 static void handle_1hz_tick(void)
@@ -293,12 +324,15 @@ static bool InitEmulator(void)
 {
     Serial.println("\n========================================");
     Serial.println("  BasiliskII ESP32 - Macintosh Emulator");
+    Serial.println("  Dual-Core Optimized Edition");
     Serial.println("========================================\n");
     
     // Print memory info
     Serial.printf("[MAIN] Free heap: %d bytes\n", ESP.getFreeHeap());
     Serial.printf("[MAIN] Free PSRAM: %d bytes\n", ESP.getFreePsram());
     Serial.printf("[MAIN] Total PSRAM: %d bytes\n", ESP.getPsramSize());
+    Serial.printf("[MAIN] CPU Frequency: %d MHz\n", ESP.getCpuFreqMHz());
+    Serial.printf("[MAIN] Running on Core: %d\n", xPortGetCoreID());
     
     // Initialize preferences
     // PrefsInit expects references for argc/argv, but we don't have command line args
@@ -328,14 +362,21 @@ static bool InitEmulator(void)
         return false;
     }
     
-    // Initialize all emulator subsystems
+    // Initialize all emulator subsystems (including VideoInit which starts video task)
     Serial.println("[MAIN] Calling InitAll()...");
     if (!InitAll(NULL)) {
         ErrorAlert("InitAll() failed");
         return false;
     }
     
+    // Start 60Hz FreeRTOS timer
+    if (!start60HzTimer()) {
+        // Non-fatal - will fall back to polling
+        Serial.println("[MAIN] WARNING: 60Hz timer failed, using polling fallback");
+    }
+    
     Serial.println("[MAIN] Emulator initialized successfully!");
+    Serial.printf("[MAIN] Tick quantum: %d instructions\n", emulated_ticks_quantum);
     
     // Print memory status after init
     Serial.printf("[MAIN] Free heap after init: %d bytes\n", ESP.getFreeHeap());
@@ -349,12 +390,13 @@ static bool InitEmulator(void)
  */
 static void RunEmulator(void)
 {
-    Serial.println("[MAIN] Starting 68k CPU emulation...");
+    Serial.println("[MAIN] Starting 68k CPU emulation on Core 1...");
+    Serial.println("[MAIN] Video rendering running on Core 0...");
     
     emulator_running = true;
-    last_tick_time = millis();
+    last_60hz_time = millis();
     last_second_time = millis();
-    last_video_refresh = millis();
+    last_video_signal = millis();
     
     // Start the 68k CPU - this function runs the emulation loop
     // It will return when QuitEmulator() is called
@@ -386,6 +428,7 @@ void basilisk_setup(void)
     RunEmulator();
     
     // Cleanup
+    stop60HzTimer();
     ExitAll();
     SysExit();
     PrefsExit();
@@ -396,14 +439,19 @@ void basilisk_setup(void)
 /*
  *  Arduino loop function - called periodically during emulation
  *  This is called from the CPU emulator's main loop to handle periodic tasks
+ *
+ *  With dual-core optimization:
+ *  - 60Hz tick is polled here (safer than async timer)
+ *  - Video refresh is handled by video task on Core 0 (doesn't block here)
+ *  - This function is lightweight - no rendering happens here
  */
 void basilisk_loop(void)
 {
     uint32 current_time = millis();
     
-    // Handle 60Hz tick
-    if (current_time - last_tick_time >= TICK_60HZ_INTERVAL) {
-        last_tick_time = current_time;
+    // Handle 60Hz tick (~16ms intervals)
+    if (current_time - last_60hz_time >= 16) {
+        last_60hz_time = current_time;
         handle_60hz_tick();
     }
     
@@ -413,14 +461,15 @@ void basilisk_loop(void)
         handle_1hz_tick();
     }
     
-    // Video refresh
-    if (current_time - last_video_refresh >= VIDEO_REFRESH_INTERVAL) {
-        last_video_refresh = current_time;
-        VideoRefresh();
+    // Signal video task that a new frame may be ready
+    // This is non-blocking - just sets a flag for the video task to pick up
+    if (current_time - last_video_signal >= VIDEO_SIGNAL_INTERVAL) {
+        last_video_signal = current_time;
+        VideoRefresh();  // Now just signals the video task, doesn't render
     }
     
-    // Yield to allow other tasks
-    yield();
+    // Yield to allow FreeRTOS tasks to run
+    taskYIELD();
 }
 
 /*

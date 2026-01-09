@@ -53,15 +53,37 @@ enum {
 	SPCFLAG_ALL_BUT_EXEC_RETURN	= SPCFLAG_ALL & ~SPCFLAG_JIT_EXEC_RETURN
 };
 
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
+/* Atomic read for ESP32 dual-core safety */
+#define SPCFLAGS_TEST(m) \
+	((__atomic_load_n(&regs.spcflags, __ATOMIC_SEQ_CST) & (m)) != 0)
+#else
 #define SPCFLAGS_TEST(m) \
 	((regs.spcflags & (m)) != 0)
+#endif
 
 /* Macro only used in m68k_reset() */
 #define SPCFLAGS_INIT(m) do { \
 	regs.spcflags = (m); \
 } while (0)
 
-#if !(ENABLE_EXCLUSIVE_SPCFLAGS)
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
+
+/*
+ * ESP32 dual-core atomic operations using GCC builtins
+ * Required for thread-safety when 60Hz timer runs on different core than CPU emulation
+ */
+#define HAVE_HARDWARE_LOCKS
+
+#define SPCFLAGS_SET(m) do { \
+	__atomic_or_fetch(&regs.spcflags, (m), __ATOMIC_SEQ_CST); \
+} while (0)
+
+#define SPCFLAGS_CLEAR(m) do { \
+	__atomic_and_fetch(&regs.spcflags, ~(m), __ATOMIC_SEQ_CST); \
+} while (0)
+
+#elif !(ENABLE_EXCLUSIVE_SPCFLAGS)
 
 #define SPCFLAGS_SET(m) do { \
 	regs.spcflags |= (m); \

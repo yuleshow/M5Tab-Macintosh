@@ -273,5 +273,6 @@ extern void VideoQuitFullScreen(void);
 
 extern void VideoInterrupt(void);
 extern void VideoRefresh(void);
+extern void VideoSignalFrameReady(void);  // Signal video task that a new frame is ready (non-blocking)
 
 #endif

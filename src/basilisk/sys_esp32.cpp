@@ -201,10 +201,20 @@ size_t Sys_read(void *arg, void *buffer, loff_t offset, size_t length)
     // Read data
     size_t bytes_read = fh->file.read((uint8_t *)buffer, length);
     
-    // Minimal logging - only every 1000 reads to avoid slowing down
-    static int read_count = 0;
-    read_count++;
-    // Uncomment for debugging: if (read_count % 1000 == 0) Serial.printf("[SYS] %d reads\n", read_count);
+    // Log first few reads from each file to see boot activity
+    static int disk_reads = 0;
+    static int cdrom_reads = 0;
+    if (fh->is_cdrom) {
+        cdrom_reads++;
+        if (cdrom_reads <= 5 || cdrom_reads % 500 == 0) {
+            Serial.printf("[BOOT] CD-ROM read #%d: offset=%lld len=%d\n", cdrom_reads, (long long)offset, (int)length);
+        }
+    } else {
+        disk_reads++;
+        if (disk_reads <= 5 || disk_reads % 500 == 0) {
+            Serial.printf("[BOOT] Disk read #%d: %s offset=%lld len=%d\n", disk_reads, fh->path, (long long)offset, (int)length);
+        }
+    }
     
     return bytes_read;
 }

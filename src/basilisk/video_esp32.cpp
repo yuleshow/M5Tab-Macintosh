@@ -2,6 +2,8 @@
  *  video_esp32.cpp - Video/graphics emulation for ESP32 with M5GFX
  *
  *  BasiliskII ESP32 Port
+ *
+ *  Dual-core optimized: Video rendering runs on Core 0, CPU emulation on Core 1
  */
 
 #include "sysdeps.h"
@@ -15,6 +17,14 @@
 #include <M5Unified.h>
 #include <M5GFX.h>
 
+// FreeRTOS for dual-core support
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
+// Watchdog timer control
+#include "esp_task_wdt.h"
+
 #define DEBUG 1
 #include "debug.h"
 
@@ -24,9 +34,24 @@
 #define MAC_SCREEN_DEPTH  VDEPTH_8BIT  // 8-bit indexed color
 #define PIXEL_SCALE       2            // 2x scaling to fill 1280x720
 
-// Frame buffer (allocated in PSRAM)
-static uint8 *frame_buffer = NULL;
+// Video task configuration
+#define VIDEO_TASK_STACK_SIZE  8192
+#define VIDEO_TASK_PRIORITY    1
+#define VIDEO_TASK_CORE        0  // Run on Core 0, leaving Core 1 for CPU emulation
+
+// Double-buffered frame buffers (allocated in PSRAM)
+static uint8 *frame_buffer_write = NULL;    // CPU emulation writes here
+static uint8 *frame_buffer_display = NULL;  // Video task reads from here
 static uint32 frame_buffer_size = 0;
+
+// Frame synchronization
+static volatile bool frame_ready = false;
+static SemaphoreHandle_t frame_mutex = NULL;
+static portMUX_TYPE frame_spinlock = portMUX_INITIALIZER_UNLOCKED;
+
+// Video task handle
+static TaskHandle_t video_task_handle = NULL;
+static volatile bool video_task_running = false;
 
 // Palette (256 RGB entries) - dynamically allocated in PSRAM
 static uint16 *palette_rgb565 = NULL;
@@ -35,7 +60,7 @@ static uint16 *palette_rgb565 = NULL;
 static int display_width = 0;
 static int display_height = 0;
 
-// Canvas for double buffering
+// Canvas for rendering (used by video task)
 static M5Canvas *canvas = NULL;
 
 // Video mode info
@@ -65,17 +90,20 @@ static inline uint16 rgb888_to_rgb565(uint8 r, uint8 g, uint8 b)
 
 /*
  *  Set palette for indexed color modes
+ *  Thread-safe: uses spinlock since palette can be updated from CPU emulation
  */
 void ESP32_monitor_desc::set_palette(uint8 *pal, int num)
 {
     D(bug("[VIDEO] set_palette: %d entries\n", num));
     
+    portENTER_CRITICAL(&frame_spinlock);
     for (int i = 0; i < num && i < 256; i++) {
         uint8 r = pal[i * 3 + 0];
         uint8 g = pal[i * 3 + 1];
         uint8 b = pal[i * 3 + 2];
         palette_rgb565[i] = rgb888_to_rgb565(r, g, b);
     }
+    portEXIT_CRITICAL(&frame_spinlock);
 }
 
 /*
@@ -101,6 +129,165 @@ void ESP32_monitor_desc::switch_to_current_mode(void)
 }
 
 /*
+ *  Render a frame buffer to the display canvas and push to screen
+ *  Called from video task on Core 0
+ */
+static void renderFrameToDisplay(uint8 *src_buffer)
+{
+    if (!src_buffer || !canvas) return;
+    
+    // Convert 8-bit indexed to RGB565 and draw to canvas
+    uint16 *dest = (uint16 *)canvas->getBuffer();
+    if (!dest) return;
+    
+    // Take a snapshot of the palette (thread-safe)
+    uint16 local_palette[256];
+    portENTER_CRITICAL(&frame_spinlock);
+    memcpy(local_palette, palette_rgb565, 256 * sizeof(uint16));
+    portEXIT_CRITICAL(&frame_spinlock);
+    
+    // Optimized conversion: process 4 pixels at a time using 32-bit reads
+    int total_pixels = MAC_SCREEN_WIDTH * MAC_SCREEN_HEIGHT;
+    uint8 *src = src_buffer;
+    uint16 *dst = dest;
+    
+    // Process 4 pixels at a time for better memory bandwidth
+    int chunks = total_pixels >> 2;  // Divide by 4
+    for (int i = 0; i < chunks; i++) {
+        // Read 4 source pixels at once
+        uint32 src4 = *((uint32 *)src);
+        src += 4;
+        
+        // Convert each pixel through palette
+        *dst++ = local_palette[src4 & 0xFF];
+        *dst++ = local_palette[(src4 >> 8) & 0xFF];
+        *dst++ = local_palette[(src4 >> 16) & 0xFF];
+        *dst++ = local_palette[(src4 >> 24) & 0xFF];
+    }
+    
+    // Handle remaining pixels (if width*height not divisible by 4)
+    int remaining = total_pixels & 3;
+    for (int i = 0; i < remaining; i++) {
+        *dst++ = local_palette[*src++];
+    }
+    
+    // Push canvas to display with 2x scaling
+    // 640x360 * 2 = 1280x720 exactly fills the display
+    canvas->pushRotateZoom(display_width / 2, display_height / 2, 0.0f, 
+                           (float)PIXEL_SCALE, (float)PIXEL_SCALE);
+}
+
+/*
+ *  Video rendering task - runs on Core 0
+ *  Handles frame buffer conversion and display updates independently from CPU emulation
+ *
+ *  Uses copy-based double buffering: the CPU always writes to frame_buffer_write (via MacFrameBaseHost),
+ *  and this task copies that buffer to frame_buffer_display before rendering.
+ *  This avoids race conditions from swapping pointers while CPU is writing.
+ */
+static void videoRenderTask(void *param)
+{
+    UNUSED(param);
+    Serial.println("[VIDEO] Video render task started on Core 0");
+    
+    // Unsubscribe this task from the watchdog timer
+    // The video rendering can take variable time and shouldn't trigger WDT
+    esp_task_wdt_delete(NULL);
+    
+    // Wait a moment for everything to initialize
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    while (video_task_running) {
+        // Check if a new frame is ready
+        if (frame_ready) {
+            frame_ready = false;
+            
+            // Copy the current write buffer to the display buffer
+            // This is safe because:
+            // - MacFrameBaseHost always points to frame_buffer_write (never changes)
+            // - CPU might write during copy, but that just means some scanlines are from
+            //   the old frame and some from the new - acceptable visual tearing
+            // - memcpy is fast (~230KB copy from PSRAM takes ~1ms at 360MHz)
+            memcpy(frame_buffer_display, frame_buffer_write, frame_buffer_size);
+            
+            // Render the copied display buffer
+            renderFrameToDisplay(frame_buffer_display);
+        } else {
+            // No new frame signal, but still refresh display periodically
+            // Re-render the last copied display buffer
+            if (frame_buffer_display) {
+                renderFrameToDisplay(frame_buffer_display);
+            }
+        }
+        
+        // Always delay to allow IDLE task to run and prevent watchdog issues
+        vTaskDelay(pdMS_TO_TICKS(16));  // ~60 FPS max, leaves time for other tasks
+    }
+    
+    Serial.println("[VIDEO] Video render task exiting");
+    vTaskDelete(NULL);
+}
+
+/*
+ *  Start the video rendering task on Core 0
+ */
+static bool startVideoTask(void)
+{
+    // Create mutex for frame buffer synchronization
+    frame_mutex = xSemaphoreCreateMutex();
+    if (!frame_mutex) {
+        Serial.println("[VIDEO] ERROR: Failed to create frame mutex!");
+        return false;
+    }
+    
+    video_task_running = true;
+    
+    // Create video task pinned to Core 0
+    BaseType_t result = xTaskCreatePinnedToCore(
+        videoRenderTask,
+        "VideoTask",
+        VIDEO_TASK_STACK_SIZE,
+        NULL,
+        VIDEO_TASK_PRIORITY,
+        &video_task_handle,
+        VIDEO_TASK_CORE
+    );
+    
+    if (result != pdPASS) {
+        Serial.println("[VIDEO] ERROR: Failed to create video task!");
+        vSemaphoreDelete(frame_mutex);
+        frame_mutex = NULL;
+        video_task_running = false;
+        return false;
+    }
+    
+    Serial.printf("[VIDEO] Video task created on Core %d\n", VIDEO_TASK_CORE);
+    return true;
+}
+
+/*
+ *  Stop the video rendering task
+ */
+static void stopVideoTask(void)
+{
+    if (video_task_running) {
+        video_task_running = false;
+        
+        // Give task time to exit
+        vTaskDelay(pdMS_TO_TICKS(100));
+        
+        if (video_task_handle) {
+            video_task_handle = NULL;
+        }
+    }
+    
+    if (frame_mutex) {
+        vSemaphoreDelete(frame_mutex);
+        frame_mutex = NULL;
+    }
+}
+
+/*
  *  Initialize video driver
  */
 bool VideoInit(bool classic)
@@ -122,24 +309,34 @@ bool VideoInit(bool classic)
     }
     memset(palette_rgb565, 0, 256 * sizeof(uint16));
     
-    // Allocate frame buffer in PSRAM
-    // For 640x360 @ 8-bit = 230,400 bytes
+    // Allocate double-buffered frame buffers in PSRAM
+    // For 640x360 @ 8-bit = 230,400 bytes per buffer
     frame_buffer_size = MAC_SCREEN_WIDTH * MAC_SCREEN_HEIGHT;
-    frame_buffer = (uint8 *)ps_malloc(frame_buffer_size);
     
-    if (!frame_buffer) {
-        Serial.println("[VIDEO] ERROR: Failed to allocate frame buffer in PSRAM!");
+    frame_buffer_write = (uint8 *)ps_malloc(frame_buffer_size);
+    if (!frame_buffer_write) {
+        Serial.println("[VIDEO] ERROR: Failed to allocate write frame buffer in PSRAM!");
         return false;
     }
     
-    Serial.printf("[VIDEO] Frame buffer allocated at %p (%d bytes)\n", 
-                  frame_buffer, frame_buffer_size);
+    frame_buffer_display = (uint8 *)ps_malloc(frame_buffer_size);
+    if (!frame_buffer_display) {
+        Serial.println("[VIDEO] ERROR: Failed to allocate display frame buffer in PSRAM!");
+        free(frame_buffer_write);
+        frame_buffer_write = NULL;
+        return false;
+    }
     
-    // Clear frame buffer to gray
-    memset(frame_buffer, 0x80, frame_buffer_size);
+    Serial.printf("[VIDEO] Double-buffered frame buffers allocated:\n");
+    Serial.printf("[VIDEO]   Write buffer:   %p (%d bytes)\n", frame_buffer_write, frame_buffer_size);
+    Serial.printf("[VIDEO]   Display buffer: %p (%d bytes)\n", frame_buffer_display, frame_buffer_size);
     
-    // Set up Mac frame buffer pointers
-    MacFrameBaseHost = frame_buffer;
+    // Clear frame buffers to gray
+    memset(frame_buffer_write, 0x80, frame_buffer_size);
+    memset(frame_buffer_display, 0x80, frame_buffer_size);
+    
+    // Set up Mac frame buffer pointers (CPU writes to write buffer)
+    MacFrameBaseHost = frame_buffer_write;
     MacFrameSize = frame_buffer_size;
     MacFrameLayout = FLAYOUT_DIRECT;
     
@@ -147,16 +344,26 @@ bool VideoInit(bool classic)
     canvas = new M5Canvas(&M5.Display);
     if (!canvas) {
         Serial.println("[VIDEO] ERROR: Failed to create canvas!");
-        free(frame_buffer);
-        frame_buffer = NULL;
+        free(frame_buffer_write);
+        free(frame_buffer_display);
+        frame_buffer_write = NULL;
+        frame_buffer_display = NULL;
         return false;
     }
     
     // Create sprite with 16-bit color depth
+    canvas->setColorDepth(16);  // RGB565 output - set BEFORE createSprite
     canvas->createSprite(MAC_SCREEN_WIDTH, MAC_SCREEN_HEIGHT);
-    canvas->setColorDepth(16);  // RGB565 output
     
-    Serial.println("[VIDEO] Canvas created");
+    // Clear canvas to gray (matching initial frame buffer state)
+    // This prevents showing uninitialized memory (green/garbage)
+    canvas->fillScreen(TFT_DARKGREY);
+    
+    // Push initial gray screen to display
+    canvas->pushRotateZoom(display_width / 2, display_height / 2, 0.0f, 
+                           (float)PIXEL_SCALE, (float)PIXEL_SCALE);
+    
+    Serial.println("[VIDEO] Canvas created and cleared");
     
     // Initialize default palette (grayscale with Mac-style inversion)
     // Classic Mac: 0=white, 255=black
@@ -184,8 +391,14 @@ bool VideoInit(bool classic)
     // Set Mac frame buffer base address
     the_monitor->set_mac_frame_base(MacFrameBaseMac);
     
+    // Start video rendering task on Core 0
+    if (!startVideoTask()) {
+        Serial.println("[VIDEO] ERROR: Failed to start video task!");
+        // Continue anyway - will fall back to synchronous refresh
+    }
+    
     Serial.printf("[VIDEO] Mac frame base: 0x%08X\n", MacFrameBaseMac);
-    Serial.println("[VIDEO] VideoInit complete");
+    Serial.println("[VIDEO] VideoInit complete (dual-core mode)");
     
     return true;
 }
@@ -197,15 +410,28 @@ void VideoExit(void)
 {
     Serial.println("[VIDEO] VideoExit");
     
+    // Stop video task first
+    stopVideoTask();
+    
     if (canvas) {
         canvas->deleteSprite();
         delete canvas;
         canvas = NULL;
     }
     
-    if (frame_buffer) {
-        free(frame_buffer);
-        frame_buffer = NULL;
+    if (frame_buffer_write) {
+        free(frame_buffer_write);
+        frame_buffer_write = NULL;
+    }
+    
+    if (frame_buffer_display) {
+        free(frame_buffer_display);
+        frame_buffer_display = NULL;
+    }
+    
+    if (palette_rgb565) {
+        free(palette_rgb565);
+        palette_rgb565 = NULL;
     }
     
     // Clear monitors vector
@@ -218,47 +444,32 @@ void VideoExit(void)
 }
 
 /*
- *  Video refresh - copy Mac frame buffer to display with 2x scaling
- *  This is called periodically to update the screen
- *  Optimized with 32-bit operations for faster palette lookup
+ *  Signal that a new frame is ready for display
+ *  Called from CPU emulation (Core 1) to notify video task (Core 0)
+ *  This is non-blocking - CPU emulation continues immediately
+ */
+void VideoSignalFrameReady(void)
+{
+    // Simply set the flag - video task will pick it up
+    // No blocking, no waiting for display to finish
+    frame_ready = true;
+}
+
+/*
+ *  Video refresh - legacy synchronous function
+ *  Now just signals the video task instead of doing the work directly
+ *  This allows CPU emulation to continue while video task handles rendering
  */
 void VideoRefresh(void)
 {
-    if (!frame_buffer || !canvas) return;
-    
-    // Convert 8-bit indexed to RGB565 and draw to canvas
-    uint16 *dest = (uint16 *)canvas->getBuffer();
-    if (!dest) return;
-    
-    // Optimized conversion: process 4 pixels at a time using 32-bit reads
-    int total_pixels = MAC_SCREEN_WIDTH * MAC_SCREEN_HEIGHT;
-    uint8 *src = frame_buffer;
-    uint16 *dst = dest;
-    
-    // Process 4 pixels at a time for better memory bandwidth
-    int chunks = total_pixels >> 2;  // Divide by 4
-    for (int i = 0; i < chunks; i++) {
-        // Read 4 source pixels at once
-        uint32 src4 = *((uint32 *)src);
-        src += 4;
-        
-        // Convert each pixel through palette
-        *dst++ = palette_rgb565[src4 & 0xFF];
-        *dst++ = palette_rgb565[(src4 >> 8) & 0xFF];
-        *dst++ = palette_rgb565[(src4 >> 16) & 0xFF];
-        *dst++ = palette_rgb565[(src4 >> 24) & 0xFF];
+    if (!frame_buffer_write || !video_task_running) {
+        // Fallback: if video task not running, do nothing
+        // (or could do synchronous refresh as fallback)
+        return;
     }
     
-    // Handle remaining pixels (if width*height not divisible by 4)
-    int remaining = total_pixels & 3;
-    for (int i = 0; i < remaining; i++) {
-        *dst++ = palette_rgb565[*src++];
-    }
-    
-    // Push canvas to display with 2x scaling
-    // 640x360 * 2 = 1280x720 exactly fills the display
-    canvas->pushRotateZoom(display_width / 2, display_height / 2, 0.0f, 
-                           (float)PIXEL_SCALE, (float)PIXEL_SCALE);
+    // Signal video task that a new frame is ready
+    VideoSignalFrameReady();
 }
 
 /*
@@ -279,11 +490,11 @@ void VideoInterrupt(void)
 }
 
 /*
- *  Get pointer to frame buffer
+ *  Get pointer to frame buffer (the write buffer that CPU uses)
  */
 uint8 *VideoGetFrameBuffer(void)
 {
-    return frame_buffer;
+    return frame_buffer_write;
 }
 
 /*

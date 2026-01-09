@@ -47,16 +47,18 @@ void LoadPrefs(const char *vmdir)
     PrefsReplaceString("disk", "*/Macintosh.dsk");
     
     // Add floppy disk image (read-only for safe booting)
-    PrefsReplaceString("floppy", "*/DiskTools1.img");
+    // PrefsReplaceString("floppy", "*/DiskTools1.img");
     
     Serial.println("[PREFS] Disk: /Macintosh.dsk (read-only)");
-    Serial.println("[PREFS] Floppy: /DiskTools1.img (read-only)");
+    // Serial.println("[PREFS] Floppy: /DiskTools1.img (read-only)");
     
     // Disable sound (for now)
     PrefsReplaceBool("nosound", true);
     
-    // Disable CD-ROM
-    PrefsReplaceBool("nocdrom", true);
+    // Enable CD-ROM and mount System 7.5.3 ISO
+    PrefsReplaceBool("nocdrom", false);
+    PrefsReplaceString("cdrom", "/System753.iso");
+    Serial.println("[PREFS] CD-ROM: /System753.iso");
     
     // No GUI
     PrefsReplaceBool("nogui", true);
