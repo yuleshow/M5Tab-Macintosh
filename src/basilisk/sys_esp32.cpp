@@ -13,7 +13,7 @@
 #include <SD.h>
 #include <FS.h>
 
-#define DEBUG 1
+#define DEBUG 0
 #include "debug.h"
 
 // File handle structure
@@ -95,60 +95,38 @@ void SysAddSerialPrefs(void)
 
 /*
  *  Open a file/device
+ *  
+ *  IMPORTANT: ESP32 SD library FILE_WRITE mode TRUNCATES files!
+ *  We ONLY use FILE_READ to be safe and prevent data loss.
  */
 void *Sys_open(const char *name, bool read_only, bool is_cdrom)
 {
     if (!name || strlen(name) == 0) {
-        D(bug("[SYS] Sys_open: empty name\n"));
+        Serial.println("[SYS] Sys_open: empty name");
         return NULL;
     }
     
-    D(bug("[SYS] Sys_open: %s (read_only=%d, cdrom=%d)\n", name, read_only, is_cdrom));
+    Serial.printf("[SYS] Sys_open: %s (requested read_only=%d)\n", name, read_only);
     
     // Allocate file handle
     file_handle *fh = new file_handle;
     if (!fh) {
-        D(bug("[SYS] Sys_open: failed to allocate file handle\n"));
+        Serial.println("[SYS] Sys_open: failed to allocate file handle");
         return NULL;
     }
     
     memset(fh, 0, sizeof(file_handle));
     strncpy(fh->path, name, sizeof(fh->path) - 1);
-    fh->read_only = read_only;
     fh->is_cdrom = is_cdrom;
     fh->is_floppy = (strstr(name, ".img") != NULL || strstr(name, ".IMG") != NULL);
     
-    // Open file
-    // ESP32 SD library quirks:
-    // - FILE_READ = "r" (read only)
-    // - FILE_WRITE = "w" (truncates file!)
-    // - FILE_APPEND = "a" (append mode)
-    // For disk images, we always open read-only first to get size, then use FILE_APPEND
-    // which allows seeking and writing to existing files on ESP32
+    // SAFETY: Always open as read-only to prevent ESP32 SD library from truncating files
+    // The ESP32 SD library's FILE_WRITE mode will DESTROY your disk images!
+    fh->read_only = true;
     
-    // First, open in read mode to check file exists and get size
-    File testFile = SD.open(name, FILE_READ);
-    if (testFile) {
-        fh->size = testFile.size();
-        testFile.close();
-        Serial.printf("[SYS] File exists: %s (size=%lld bytes)\n", name, (long long)fh->size);
-    } else {
-        fh->size = 0;
-        Serial.printf("[SYS] File not found or empty: %s\n", name);
-    }
-    
-    // Now open for actual access
-    if (read_only) {
-        fh->file = SD.open(name, FILE_READ);
-    } else {
-        // Use FILE_APPEND for read+write access to existing file
-        // FILE_APPEND ("a+") allows reading and writing, and doesn't truncate
-        fh->file = SD.open(name, FILE_APPEND);
-        if (fh->file) {
-            // Seek to beginning for random access
-            fh->file.seek(0);
-        }
-    }
+    // Open file in READ-ONLY mode - this is the ONLY safe mode on ESP32
+    Serial.printf("[SYS] Opening %s in READ-ONLY mode (safe mode)\n", name);
+    fh->file = SD.open(name, FILE_READ);
     
     if (!fh->file) {
         Serial.printf("[SYS] ERROR: Cannot open file: %s\n", name);
@@ -156,9 +134,32 @@ void *Sys_open(const char *name, bool read_only, bool is_cdrom)
         return NULL;
     }
     
+    // Get file size
+    fh->size = fh->file.size();
+    Serial.printf("[SYS] File size from size(): %lld bytes\n", (long long)fh->size);
+    
+    // If size() returns 0, try alternative methods
+    if (fh->size == 0) {
+        // Method: seek to end and get position
+        if (fh->file.seek(0, SeekEnd)) {
+            fh->size = fh->file.position();
+            fh->file.seek(0, SeekSet);
+            Serial.printf("[SYS] File size from seek: %lld bytes\n", (long long)fh->size);
+        }
+    }
+    
+    // Validate file size
+    if (fh->size == 0) {
+        Serial.printf("[SYS] ERROR: File %s appears to be empty or size cannot be determined\n", name);
+        fh->file.close();
+        delete fh;
+        return NULL;
+    }
+    
     fh->is_open = true;
     
-    Serial.printf("[SYS] Opened: %s (size=%lld bytes, ro=%d)\n", name, (long long)fh->size, read_only);
+    Serial.printf("[SYS] SUCCESS: Opened %s (%lld bytes = %lld KB, floppy=%d, read_only=1)\n", 
+                  name, (long long)fh->size, (long long)(fh->size / 1024), fh->is_floppy);
     
     return fh;
 }
@@ -200,8 +201,10 @@ size_t Sys_read(void *arg, void *buffer, loff_t offset, size_t length)
     // Read data
     size_t bytes_read = fh->file.read((uint8_t *)buffer, length);
     
-    D(bug("[SYS] Sys_read: %s offset=%lld len=%d read=%d\n", 
-          fh->path, (long long)offset, (int)length, (int)bytes_read));
+    // Minimal logging - only every 1000 reads to avoid slowing down
+    static int read_count = 0;
+    read_count++;
+    // Uncomment for debugging: if (read_count % 1000 == 0) Serial.printf("[SYS] %d reads\n", read_count);
     
     return bytes_read;
 }

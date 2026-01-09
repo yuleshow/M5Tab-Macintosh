@@ -45,6 +45,13 @@ using std::vector;
 #define DEBUG 0
 #include "debug.h"
 
+// Quiet mode - only important messages  
+#ifdef ARDUINO
+#define DISK_DEBUG(fmt, ...) // Serial.printf("[DISK] " fmt "\n", ##__VA_ARGS__)
+#else
+#define DISK_DEBUG(fmt, ...) // printf("[DISK] " fmt "\n", ##__VA_ARGS__)
+#endif
+
 
 // .Disk Disk/drive icon
 const uint8 DiskIcon[258] = {
@@ -151,23 +158,34 @@ static void find_hfs_partition(disk_drive_info &info)
 
 void DiskInit(void)
 {
+	DISK_DEBUG("DiskInit() called");
+	
 	// No drives specified in prefs? Then add defaults
-	if (PrefsFindString("disk", 0) == NULL)
+	if (PrefsFindString("disk", 0) == NULL) {
+		DISK_DEBUG("No disk prefs found, adding defaults");
 		SysAddDiskPrefs();
+	}
 
 	// Add drives specified in preferences
 	int index = 0;
 	const char *str;
 	while ((str = PrefsFindString("disk", index++)) != NULL) {
+		DISK_DEBUG("Found disk pref [%d]: %s", index-1, str);
 		bool read_only = false;
 		if (str[0] == '*') {
 			read_only = true;
 			str++;
 		}
 		void *fh = Sys_open(str, read_only);
-		if (fh)
+		if (fh) {
+			DISK_DEBUG("  Opened successfully, size=%lld bytes", (long long)SysGetFileSize(fh));
 			drives.push_back(disk_drive_info(fh, SysIsReadOnly(fh)));
+		} else {
+			DISK_DEBUG("  ERROR: Failed to open %s", str);
+		}
 	}
+	
+	DISK_DEBUG("DiskInit() complete, %d drives", (int)drives.size());
 }
 
 

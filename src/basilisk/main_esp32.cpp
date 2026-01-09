@@ -300,13 +300,11 @@ static bool InitEmulator(void)
     
     // Initialize preferences
     // PrefsInit expects references for argc/argv, but we don't have command line args
+    // PrefsInit() internally calls LoadPrefs(), so we don't call it again
     int dummy_argc = 0;
     char *dummy_argv_data[] = { NULL };
     char **dummy_argv = dummy_argv_data;
     PrefsInit(NULL, dummy_argc, dummy_argv);
-    
-    // Load preferences (hardcoded for ESP32)
-    LoadPrefs(NULL);
     
     // Initialize system I/O (SD card)
     SysInit();

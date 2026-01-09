@@ -48,6 +48,13 @@ using std::vector;
 #define DEBUG 0
 #include "debug.h"
 
+// Quiet mode - only important messages
+#ifdef ARDUINO
+#define SONY_DEBUG(fmt, ...) // Serial.printf("[SONY] " fmt "\n", ##__VA_ARGS__)
+#else
+#define SONY_DEBUG(fmt, ...) // printf("[SONY] " fmt "\n", ##__VA_ARGS__)
+#endif
+
 
 // Check for inserted disks by polling?
 #ifdef AMIGA
@@ -151,23 +158,34 @@ static drive_vec::iterator get_drive_info(int num)
 
 void SonyInit(void)
 {
+	SONY_DEBUG("SonyInit() called");
+	
 	// No drives specified in prefs? Then add defaults
-	if (PrefsFindString("floppy", 0) == NULL)
+	if (PrefsFindString("floppy", 0) == NULL) {
+		SONY_DEBUG("No floppy prefs found, adding defaults");
 		SysAddFloppyPrefs();
+	}
 
 	// Add drives specified in preferences
 	int index = 0;
 	const char *str;
 	while ((str = PrefsFindString("floppy", index++)) != NULL) {
+		SONY_DEBUG("Found floppy pref [%d]: %s", index-1, str);
 		bool read_only = false;
 		if (str[0] == '*') {
 			read_only = true;
 			str++;
 		}
 		void *fh = Sys_open(str, read_only);
-		if (fh)
+		if (fh) {
+			SONY_DEBUG("  Opened successfully, size=%lld bytes", (long long)SysGetFileSize(fh));
 			drives.push_back(sony_drive_info(fh, SysIsReadOnly(fh)));
+		} else {
+			SONY_DEBUG("  ERROR: Failed to open %s", str);
+		}
 	}
+	
+	SONY_DEBUG("SonyInit() complete, %d drives", (int)drives.size());
 }
 
 
@@ -247,7 +265,7 @@ static void mount_mountable_volumes(void)
 
 static int16 set_dsk_err(int16 err)
 {
-	D(bug("set_dsk_err(%d)\n", err));
+	// Don't log every disk error check - too spammy
 	WriteMacInt16(0x142, err);
 	return err;
 }
@@ -259,7 +277,7 @@ static int16 set_dsk_err(int16 err)
 
 int16 SonyOpen(uint32 pb, uint32 dce)
 {
-	D(bug("SonyOpen\n"));
+	SONY_DEBUG("SonyOpen() called, %d drives registered", (int)drives.size());
 
 	// Set up DCE
 	WriteMacInt32(dce + dCtlPosition, 0);
@@ -277,6 +295,7 @@ int16 SonyOpen(uint32 pb, uint32 dce)
 	set_dsk_err(0);
 
 	// Install drives
+	int drive_count = 0;
 	drive_vec::iterator info, end = drives.end();
 	for (info = drives.begin(); info != end; ++info) {
 
@@ -284,15 +303,18 @@ int16 SonyOpen(uint32 pb, uint32 dce)
 		info->to_be_mounted = false;
 
 		if (info->fh) {
+			SONY_DEBUG("Installing drive %d, fh=%p", info->num, info->fh);
 
 			// Allocate drive status record
 			M68kRegisters r;
 			r.d[0] = SIZEOF_DrvSts;
 			Execute68kTrap(0xa71e, &r);		// NewPtrSysClear()
-			if (r.a[0] == 0)
+			if (r.a[0] == 0) {
+				SONY_DEBUG("  ERROR: Failed to allocate DrvSts");
 				continue;
+			}
 			info->status = r.a[0];
-			D(bug(" DrvSts at %08lx\n", info->status));
+			SONY_DEBUG("  DrvSts at 0x%08lx", (unsigned long)info->status);
 
 			// Set up drive status
 			WriteMacInt16(info->status + dsQType, sony);
@@ -305,20 +327,25 @@ int16 SonyOpen(uint32 pb, uint32 dce)
 			WriteMacInt8(info->status + dsTwoMegFmt, 0xff);	// 1.44MB (0 = 720K)
 
 			// Disk in drive?
-			if (SysIsDiskInserted(info->fh)) {
+			bool disk_inserted = SysIsDiskInserted(info->fh);
+			SONY_DEBUG("  SysIsDiskInserted: %s", disk_inserted ? "YES" : "NO");
+			if (disk_inserted) {
 				WriteMacInt8(info->status + dsDiskInPlace, 1);	// Inserted removable disk
 				WriteMacInt8(info->status + dsWriteProt, info->read_only ? 0xff : 0);
-				D(bug(" disk inserted, flagging for mount\n"));
+				SONY_DEBUG("  Flagging for mount (read_only=%d)", info->read_only);
 				info->to_be_mounted = true;
 			}
 
 			// Add drive to drive queue
-			D(bug(" adding drive %d\n", info->num));
+			SONY_DEBUG("  Adding drive %d to queue", info->num);
 			r.d[0] = (info->num << 16) | (SonyRefNum & 0xffff);
 			r.a[0] = info->status + dsQLink;
 			Execute68kTrap(0xa04e, &r);	// AddDrive()
+			drive_count++;
 		}
 	}
+	
+	SONY_DEBUG("SonyOpen() complete, installed %d drives", drive_count);
 	return noErr;
 }
 

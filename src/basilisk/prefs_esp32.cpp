@@ -7,7 +7,7 @@
 #include "sysdeps.h"
 #include "prefs.h"
 
-#define DEBUG 1
+#define DEBUG 0
 #include "debug.h"
 
 // Platform-specific preferences items
@@ -43,11 +43,14 @@ void LoadPrefs(const char *vmdir)
     // Set screen configuration
     PrefsReplaceString("screen", "win/640/480");
     
-    // Add hard disk image
-    PrefsAddString("disk", "/Macintosh.dsk");
+    // Add hard disk image (read-only for safety on ESP32)
+    PrefsReplaceString("disk", "*/Macintosh.dsk");
     
-    // Add floppy disk image  
-    PrefsAddString("floppy", "/DiskTools1.img");
+    // Add floppy disk image (read-only for safe booting)
+    PrefsReplaceString("floppy", "*/DiskTools1.img");
+    
+    Serial.println("[PREFS] Disk: /Macintosh.dsk (read-only)");
+    Serial.println("[PREFS] Floppy: /DiskTools1.img (read-only)");
     
     // Disable sound (for now)
     PrefsReplaceBool("nosound", true);
