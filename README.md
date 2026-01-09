@@ -194,11 +194,38 @@ dd if=/dev/zero of=Macintosh.dsk bs=1M count=500
 
 Then format it during Mac OS installation.
 
-### Building & Flashing
+### Flashing the Firmware
+
+#### Option 1: Pre-built Firmware (Easiest)
+
+Download the latest release from GitHub:
+
+**[📥 Download Latest Release](https://github.com/amcchord/M5Tab-Macintosh/releases/latest)**
+
+Flash using `esptool.py`:
+
+```bash
+# Install esptool if you don't have it
+pip install esptool
+
+# Flash all three binary files (connect Tab5 via USB-C)
+esptool.py --chip esp32p4 --port /dev/ttyACM0 --baud 921600 \
+    write_flash \
+    0x0 bootloader.bin \
+    0x10000 firmware.bin \
+    0x8000 partitions.bin
+```
+
+**Note**: Replace `/dev/ttyACM0` with your actual port:
+- **macOS**: `/dev/cu.usbmodem*` or `/dev/tty.usbmodem*`
+- **Windows**: `COM3` (or similar)
+- **Linux**: `/dev/ttyACM0` or `/dev/ttyUSB0`
+
+#### Option 2: Build from Source
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/M5Tab-Macintosh.git
+git clone https://github.com/amcchord/M5Tab-Macintosh.git
 cd M5Tab-Macintosh
 
 # Build the firmware
