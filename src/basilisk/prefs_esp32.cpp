@@ -37,28 +37,22 @@ void LoadPrefs(const char *vmdir)
     // Disable FPU (not implemented on ESP32)
     PrefsReplaceBool("fpu", false);
     
-    // Set RAM size to 8MB
-    PrefsReplaceInt32("ramsize", 8 * 1024 * 1024);
+    // Set RAM size to 16MB
+    PrefsReplaceInt32("ramsize", 16 * 1024 * 1024);
     
     // Set screen configuration
     PrefsReplaceString("screen", "win/640/480");
     
-    // Add hard disk image (read-only for safety on ESP32)
-    PrefsReplaceString("disk", "*/Macintosh.dsk");
+    // Add hard disk image (read-write enabled)
+    PrefsReplaceString("disk", "/Macintosh8.dsk");
     
-    // Add floppy disk image (read-only for safe booting)
-    // PrefsReplaceString("floppy", "*/DiskTools1.img");
-    
-    Serial.println("[PREFS] Disk: /Macintosh.dsk (read-only)");
-    // Serial.println("[PREFS] Floppy: /DiskTools1.img (read-only)");
+    Serial.println("[PREFS] Disk: /Macintosh8.dsk (read-write)");
     
     // Disable sound (for now)
     PrefsReplaceBool("nosound", true);
     
-    // Enable CD-ROM and mount System 7.5.3 ISO
-    PrefsReplaceBool("nocdrom", false);
-    PrefsReplaceString("cdrom", "/System753.iso");
-    Serial.println("[PREFS] CD-ROM: /System753.iso");
+    // Disable CD-ROM
+    PrefsReplaceBool("nocdrom", true);
     
     // No GUI
     PrefsReplaceBool("nogui", true);

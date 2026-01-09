@@ -96,8 +96,9 @@ void SysAddSerialPrefs(void)
 /*
  *  Open a file/device
  *  
- *  IMPORTANT: ESP32 SD library FILE_WRITE mode TRUNCATES files!
- *  We ONLY use FILE_READ to be safe and prevent data loss.
+ *  For read-write access, we use "r+b" mode which opens an existing file
+ *  for both reading and writing WITHOUT truncation.
+ *  DO NOT use FILE_WRITE as it will TRUNCATE the file!
  */
 void *Sys_open(const char *name, bool read_only, bool is_cdrom)
 {
@@ -106,7 +107,7 @@ void *Sys_open(const char *name, bool read_only, bool is_cdrom)
         return NULL;
     }
     
-    Serial.printf("[SYS] Sys_open: %s (requested read_only=%d)\n", name, read_only);
+    Serial.printf("[SYS] Sys_open: %s (requested read_only=%d, is_cdrom=%d)\n", name, read_only, is_cdrom);
     
     // Allocate file handle
     file_handle *fh = new file_handle;
@@ -120,13 +121,30 @@ void *Sys_open(const char *name, bool read_only, bool is_cdrom)
     fh->is_cdrom = is_cdrom;
     fh->is_floppy = (strstr(name, ".img") != NULL || strstr(name, ".IMG") != NULL);
     
-    // SAFETY: Always open as read-only to prevent ESP32 SD library from truncating files
-    // The ESP32 SD library's FILE_WRITE mode will DESTROY your disk images!
-    fh->read_only = true;
+    // CD-ROMs and ISO files are always read-only
+    // Otherwise, respect the read_only parameter from caller
+    if (is_cdrom || strstr(name, ".iso") != NULL || strstr(name, ".ISO") != NULL) {
+        fh->read_only = true;
+    } else {
+        fh->read_only = read_only;
+    }
     
-    // Open file in READ-ONLY mode - this is the ONLY safe mode on ESP32
-    Serial.printf("[SYS] Opening %s in READ-ONLY mode (safe mode)\n", name);
-    fh->file = SD.open(name, FILE_READ);
+    // Open file based on read_only flag
+    if (fh->read_only) {
+        Serial.printf("[SYS] Opening %s in READ-ONLY mode\n", name);
+        fh->file = SD.open(name, FILE_READ);
+    } else {
+        // Use "r+b" mode: read+write without truncation (binary mode)
+        // This is safe - it does NOT truncate like FILE_WRITE does
+        Serial.printf("[SYS] Opening %s in READ-WRITE mode (r+b)\n", name);
+        fh->file = SD.open(name, "r+b");
+        if (!fh->file) {
+            // Fall back to read-only if read-write mode fails
+            Serial.printf("[SYS] WARNING: Read-write open failed, falling back to read-only\n");
+            fh->file = SD.open(name, FILE_READ);
+            fh->read_only = true;
+        }
+    }
     
     if (!fh->file) {
         Serial.printf("[SYS] ERROR: Cannot open file: %s\n", name);
@@ -158,8 +176,8 @@ void *Sys_open(const char *name, bool read_only, bool is_cdrom)
     
     fh->is_open = true;
     
-    Serial.printf("[SYS] SUCCESS: Opened %s (%lld bytes = %lld KB, floppy=%d, read_only=1)\n", 
-                  name, (long long)fh->size, (long long)(fh->size / 1024), fh->is_floppy);
+    Serial.printf("[SYS] SUCCESS: Opened %s (%lld bytes = %lld KB, floppy=%d, read_only=%d)\n", 
+                  name, (long long)fh->size, (long long)(fh->size / 1024), fh->is_floppy, fh->read_only);
     
     return fh;
 }
@@ -225,21 +243,36 @@ size_t Sys_read(void *arg, void *buffer, loff_t offset, size_t length)
 size_t Sys_write(void *arg, void *buffer, loff_t offset, size_t length)
 {
     file_handle *fh = (file_handle *)arg;
-    if (!fh || !fh->is_open || !buffer || fh->read_only) {
+    if (!fh || !fh->is_open || !buffer) {
+        return 0;
+    }
+    
+    if (fh->read_only) {
+        // Log write attempts to read-only disks
+        static int ro_write_attempts = 0;
+        ro_write_attempts++;
+        if (ro_write_attempts <= 5 || ro_write_attempts % 100 == 0) {
+            Serial.printf("[SYS] Write blocked (read-only): %s attempt #%d\n", fh->path, ro_write_attempts);
+        }
         return 0;
     }
     
     // Seek to offset
     if (!fh->file.seek(offset)) {
-        D(bug("[SYS] Sys_write: seek failed to offset %lld\n", (long long)offset));
+        Serial.printf("[SYS] Sys_write: seek failed to offset %lld\n", (long long)offset);
         return 0;
     }
     
     // Write data
     size_t bytes_written = fh->file.write((uint8_t *)buffer, length);
     
-    D(bug("[SYS] Sys_write: %s offset=%lld len=%d written=%d\n",
-          fh->path, (long long)offset, (int)length, (int)bytes_written));
+    // Log write operations to track disk activity
+    static int disk_writes = 0;
+    disk_writes++;
+    if (disk_writes <= 10 || disk_writes % 100 == 0) {
+        Serial.printf("[SYS] Disk write #%d: %s offset=%lld len=%d written=%d\n",
+                      disk_writes, fh->path, (long long)offset, (int)length, (int)bytes_written);
+    }
     
     return bytes_written;
 }
