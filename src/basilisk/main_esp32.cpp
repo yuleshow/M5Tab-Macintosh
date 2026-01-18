@@ -155,7 +155,7 @@ static uint32 last_disk_flush_time = 0;
 
 // Video signal interval (ms) - how often to signal video task
 // The video task runs at its own pace, this just triggers buffer swap
-#define VIDEO_SIGNAL_INTERVAL 67  // ~15 FPS
+#define VIDEO_SIGNAL_INTERVAL 42  // ~24 FPS
 
 // Disk flush interval (ms) - how often to flush write buffer to SD card
 #define DISK_FLUSH_INTERVAL 2000  // 2 seconds

@@ -81,8 +81,11 @@
 #define TOTAL_TILES       (TILES_X * TILES_Y)  // 144 tiles
 
 // Dirty tile threshold - if more than this percentage of tiles are dirty,
-// do a full update instead of partial (reduces API overhead)
-#define DIRTY_THRESHOLD_PERCENT  80
+// do a full update instead of partial
+// NOTE: Set to 101 to ALWAYS use tile mode - tile updates are actually faster
+// than full streaming even when all tiles are dirty, because tile mode uses
+// double-buffered DMA while streaming mode processes rows sequentially
+#define DIRTY_THRESHOLD_PERCENT  101
 
 // Video task configuration
 #define VIDEO_TASK_STACK_SIZE  8192
@@ -105,6 +108,9 @@ static volatile bool video_task_running = false;
 // This is accessed for every pixel during video conversion
 DRAM_ATTR static uint16 palette_rgb565[256];
 
+// Flag to track if palette has changed - avoids unnecessary copies in video task
+static volatile bool palette_changed = true;
+
 // Dirty tile bitmap - in internal SRAM for fast access during video frame processing
 DRAM_ATTR static uint32 dirty_tiles[(TOTAL_TILES + 31) / 32];          // Bitmap of dirty tiles (read by video task)
 
@@ -112,12 +118,16 @@ DRAM_ATTR static uint32 dirty_tiles[(TOTAL_TILES + 31) / 32];          // Bitmap
 // This is double-buffered to avoid race conditions between CPU writes and video task reads
 DRAM_ATTR static uint32 write_dirty_tiles[(TOTAL_TILES + 31) / 32];    // Tiles dirtied by CPU writes
 
-// Row buffer for streaming full-frame renders
-// Processes 2 Mac rows at a time (becomes 4 display rows with 2x scaling)
-// Size: 1280 pixels * 4 rows * 2 bytes = 10,240 bytes (10KB)
+// Double-buffered row buffers for streaming full-frame renders with async DMA
+// Processes 4 Mac rows at a time (becomes 8 display rows with 2x scaling)
+// Size: 1280 pixels * 8 rows * 2 bytes = 20,480 bytes (20KB) per buffer
+// Double-buffering allows rendering to one buffer while DMA pushes the other
 // In internal SRAM for fast access during full-frame renders
-#define STREAMING_ROW_COUNT 4
-DRAM_ATTR static uint16 streaming_row_buffer[DISPLAY_WIDTH * STREAMING_ROW_COUNT];
+#define STREAMING_ROW_COUNT 8
+DRAM_ATTR static uint16 streaming_row_buffer_a[DISPLAY_WIDTH * STREAMING_ROW_COUNT];
+DRAM_ATTR static uint16 streaming_row_buffer_b[DISPLAY_WIDTH * STREAMING_ROW_COUNT];
+static uint16 *render_buffer = streaming_row_buffer_a;
+static uint16 *push_buffer = streaming_row_buffer_b;
 
 static volatile bool force_full_update = true;               // Force full update on first frame or palette change
 static int dirty_tile_count = 0;                             // Count of dirty tiles for threshold check
@@ -194,6 +204,7 @@ void ESP32_monitor_desc::set_palette(uint8 *pal, int num)
         uint8 b = pal[i * 3 + 2];
         palette_rgb565[i] = rgb888_to_rgb565(r, g, b);
     }
+    palette_changed = true;
     portEXIT_CRITICAL(&frame_spinlock);
     
     // Force a full screen update since palette affects all pixels
@@ -774,6 +785,7 @@ static void renderAndPushDirtyTiles(uint8 *src_buffer, uint16 *local_palette)
     
     int tile_pixel_width = TILE_WIDTH * PIXEL_SCALE;
     int tile_pixel_height = TILE_HEIGHT * PIXEL_SCALE;
+    int tiles_rendered = 0;
     
     M5.Display.startWrite();
     
@@ -802,6 +814,15 @@ static void renderAndPushDirtyTiles(uint8 *src_buffer, uint16 *local_palette)
             
             M5.Display.setAddrWindow(dst_start_x, dst_start_y, tile_pixel_width, tile_pixel_height);
             M5.Display.writePixels(tile_buffer, tile_pixel_width * tile_pixel_height);
+            
+            tiles_rendered++;
+            
+            // Every 16 tiles, yield to let IDLE task run and pet watchdog
+            // This prevents watchdog timeout during full-screen updates
+            if ((tiles_rendered & 0x0F) == 0) {
+                esp_task_wdt_reset();
+                taskYIELD();
+            }
         }
     }
     
@@ -833,15 +854,19 @@ static void renderFrameStreaming(uint8 *src_buffer, uint16 *local_palette)
     // In internal SRAM for fast access during rendering
     DRAM_ATTR static uint8 decoded_row[MAC_SCREEN_WIDTH];
     
+    // Track if we have a pending DMA transfer
+    bool dma_pending = false;
+    int pending_display_y = 0;
+    
     M5.Display.startWrite();
     
-    // Process 2 Mac rows at a time (produces 4 display rows with 2x scaling)
-    // This matches the streaming_row_buffer size
-    for (int mac_y = 0; mac_y < MAC_SCREEN_HEIGHT; mac_y += 2) {
-        uint16 *out = streaming_row_buffer;
+    // Process 4 Mac rows at a time (produces 8 display rows with 2x scaling)
+    // Double-buffering: render to one buffer while DMA pushes the other
+    for (int mac_y = 0; mac_y < MAC_SCREEN_HEIGHT; mac_y += 4) {
+        uint16 *out = render_buffer;
         
-        // Process 2 Mac rows
-        for (int row_offset = 0; row_offset < 2; row_offset++) {
+        // Process 4 Mac rows into render_buffer
+        for (int row_offset = 0; row_offset < 4; row_offset++) {
             int y = mac_y + row_offset;
             if (y >= MAC_SCREEN_HEIGHT) break;
             
@@ -904,17 +929,35 @@ static void renderFrameStreaming(uint8 *src_buffer, uint16 *local_palette)
             out += DISPLAY_WIDTH * 2;
         }
         
-        // Push this chunk immediately to display
-        // 4 display rows * 1280 pixels = 5120 pixels per chunk
+        // Wait for any pending DMA transfer to complete before swapping buffers
+        if (dma_pending) {
+            M5.Display.waitDMA();
+            dma_pending = false;
+        }
+        
+        // Swap buffers - render_buffer becomes push_buffer for DMA
+        uint16 *temp = render_buffer;
+        render_buffer = push_buffer;
+        push_buffer = temp;
+        
+        // Start async DMA push of the just-rendered buffer (now in push_buffer)
+        // 8 display rows * 1280 pixels = 10240 pixels per chunk
         int display_y = mac_y * PIXEL_SCALE;
         M5.Display.setAddrWindow(0, display_y, DISPLAY_WIDTH, STREAMING_ROW_COUNT);
-        M5.Display.writePixels(streaming_row_buffer, DISPLAY_WIDTH * STREAMING_ROW_COUNT);
+        M5.Display.writePixelsDMA(push_buffer, DISPLAY_WIDTH * STREAMING_ROW_COUNT);
+        dma_pending = true;
+        pending_display_y = display_y;
         
-        // Yield every 32 Mac rows (16 iterations) to let IDLE task run
+        // Yield every 32 Mac rows (8 iterations) to let IDLE task run
         // This prevents watchdog timeout during full-frame renders
         if ((mac_y & 0x1F) == 0) {
             taskYIELD();
         }
+    }
+    
+    // Wait for final DMA transfer to complete
+    if (dma_pending) {
+        M5.Display.waitDMA();
     }
     
     M5.Display.endWrite();
@@ -982,8 +1025,9 @@ static void videoRenderTaskOptimized(void *param)
     UNUSED(param);
     Serial.println("[VIDEO] Video render task started on Core 0 (write-time dirty tracking)");
     
-    // Unsubscribe this task from the watchdog timer
-    esp_task_wdt_delete(NULL);
+    // Subscribe this task to the watchdog timer if not already
+    // We'll reset it at the start of each frame to prevent timeout during long renders
+    esp_task_wdt_add(NULL);
     
     // Wait a moment for everything to initialize
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -994,11 +1038,16 @@ static void videoRenderTaskOptimized(void *param)
     // Initialize perf reporting timer
     perf_last_report_ms = millis();
     
-    // Minimum frame interval (67ms = ~15 FPS)
-    const TickType_t min_frame_ticks = pdMS_TO_TICKS(67);
+    // Minimum frame interval (42ms = ~24 FPS)
+    // 24fps is cinema standard and perceptually smooth
+    const TickType_t min_frame_ticks = pdMS_TO_TICKS(42);
     TickType_t last_frame_ticks = xTaskGetTickCount();
     
     while (video_task_running) {
+        // Pet the watchdog at the start of each frame to prevent reboot
+        // This is important because frame rendering can take 50-100ms
+        esp_task_wdt_reset();
+        
         // Event-driven: wait for frame signal with timeout
         // This replaces the old polling loop - task sleeps until signaled
         // Max wait time ensures we still render periodically even if no signal
@@ -1024,50 +1073,36 @@ static void videoRenderTaskOptimized(void *param)
         
         uint32_t t0, t1;
         
-        // Take a snapshot of the palette (thread-safe)
-        portENTER_CRITICAL(&frame_spinlock);
-        memcpy(local_palette, palette_rgb565, 256 * sizeof(uint16));
-        portEXIT_CRITICAL(&frame_spinlock);
-        
-        // Check if we need a full update (first frame, palette change, etc.)
-        bool do_full_update = force_full_update;
-        
-        if (!do_full_update) {
-            // WRITE-TIME DIRTY TRACKING: Collect dirty tiles marked by CPU writes
-            // This is MUCH faster than frame comparison - just atomically reads and clears
-            // the dirty bitmap that was populated by frame_direct_*_put calls
-            t0 = micros();
-            dirty_tile_count = collectWriteDirtyTiles();
-            t1 = micros();
-            perf_detect_us += (t1 - t0);
-            
-            // If too many tiles are dirty, do a full update instead
-            // (reduces overhead of many small transfers)
-            int dirty_threshold = (TOTAL_TILES * DIRTY_THRESHOLD_PERCENT) / 100;
-            if (dirty_tile_count > dirty_threshold) {
-                do_full_update = true;
-                D(bug("[VIDEO] %d/%d tiles dirty (>%d%%), doing full update\n", 
-                      dirty_tile_count, TOTAL_TILES, DIRTY_THRESHOLD_PERCENT));
-            }
+        // Take a snapshot of the palette only if it changed (thread-safe)
+        // This avoids 512-byte memcpy and spinlock contention on every frame
+        if (palette_changed) {
+            portENTER_CRITICAL(&frame_spinlock);
+            memcpy(local_palette, palette_rgb565, 256 * sizeof(uint16));
+            palette_changed = false;
+            portEXIT_CRITICAL(&frame_spinlock);
         }
         
-        // RENDER - read directly from mac_frame_buffer (no snapshot needed with write-dirty)
-        if (do_full_update) {
-            // Full update: stream-render entire frame directly to display
-            // Uses internal SRAM row buffer, no PSRAM intermediate buffer needed
-            t0 = micros();
-            renderFrameStreaming(mac_frame_buffer, local_palette);
-            t1 = micros();
-            perf_render_us += (t1 - t0);
-            
-            // Clear force_full_update flag
+        // Collect dirty tiles from write-time tracking
+        t0 = micros();
+        dirty_tile_count = collectWriteDirtyTiles();
+        t1 = micros();
+        perf_detect_us += (t1 - t0);
+        
+        // If force_full_update is set (palette change, first frame), mark ALL tiles dirty
+        // This ensures we always use tile mode (faster than streaming mode)
+        if (force_full_update) {
+            // Mark all tiles as dirty
+            for (int i = 0; i < (TOTAL_TILES + 31) / 32; i++) {
+                dirty_tiles[i] = 0xFFFFFFFF;
+            }
+            dirty_tile_count = TOTAL_TILES;
             force_full_update = false;
             perf_full_count++;
-            
-            D(bug("[VIDEO] Full update complete (streaming)\n"));
-        } else if (dirty_tile_count > 0) {
-            // Partial update: render and push only dirty tiles
-            // Read directly from mac_frame_buffer
+        }
+        
+        // RENDER - always use tile mode (faster than streaming even for full screen)
+        if (dirty_tile_count > 0) {
+            // Render and push only dirty tiles
             t0 = micros();
             renderAndPushDirtyTiles(mac_frame_buffer, local_palette);
             t1 = micros();
@@ -1133,12 +1168,12 @@ bool VideoInit(bool classic)
     // Clear display to dark gray using streaming row buffer
     uint16 gray565 = rgb888_to_rgb565(64, 64, 64);
     for (int i = 0; i < DISPLAY_WIDTH * STREAMING_ROW_COUNT; i++) {
-        streaming_row_buffer[i] = gray565;
+        streaming_row_buffer_a[i] = gray565;
     }
     M5.Display.startWrite();
     for (int y = 0; y < DISPLAY_HEIGHT; y += STREAMING_ROW_COUNT) {
         M5.Display.setAddrWindow(0, y, DISPLAY_WIDTH, STREAMING_ROW_COUNT);
-        M5.Display.writePixels(streaming_row_buffer, DISPLAY_WIDTH * STREAMING_ROW_COUNT);
+        M5.Display.writePixels(streaming_row_buffer_a, DISPLAY_WIDTH * STREAMING_ROW_COUNT);
     }
     M5.Display.endWrite();
     Serial.println("[VIDEO] Initial screen cleared");
