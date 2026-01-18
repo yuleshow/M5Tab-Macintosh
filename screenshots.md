@@ -1,5 +1,15 @@
 # Screenshots & Animations
 
+## Flying Toasters v2.5 (Performance Update)
+
+<p align="center">
+  <img src="screenshots/Toasters2.5.gif" alt="Flying Toasters v2.5"/>
+</p>
+
+Flying Toasters running smoothly after the v2.5 performance optimizations — write-time dirty tracking, packed pixel support, and optimized memory placement.
+
+---
+
 ## System 7.5.3 Booting
 
 <p align="center">
@@ -10,13 +20,23 @@ Watch the full boot sequence from ROM initialization through to the Mac OS 7.5.3
 
 ---
 
-## Flying Toasters Screensaver
+## Flying Toasters (Original)
 
 <p align="center">
   <img src="screenshots/Toasters.gif" alt="Flying Toasters Screensaver"/>
 </p>
 
 The classic After Dark Flying Toasters screensaver running on real Mac OS via the emulator.
+
+---
+
+## Performance Statistics
+
+<p align="center">
+  <img src="screenshots/Performance.jpeg" width="80%" alt="Performance Statistics"/>
+</p>
+
+Serial output showing the v2.5 performance monitoring — CPU cycles, video frame times, cache statistics, and more.
 
 ---
 

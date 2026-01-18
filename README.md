@@ -8,6 +8,12 @@ A full port of the **BasiliskII** Macintosh 68k emulator to the ESP32-P4 microco
 ## Screenshots
 
 <p align="center">
+  <img src="screenshots/Toasters2.5.gif" alt="Flying Toasters v2.5"/>
+</p>
+
+*Flying Toasters running smoothly after v2.5 performance optimizations*
+
+<p align="center">
   <img src="screenshots/MacOS8.1_Booted.jpeg" width="45%" alt="Mac OS 8.1 Desktop"/>
   <img src="screenshots/MacOS8.1_About.jpeg" width="45%" alt="Mac OS 8.1 About This Macintosh"/>
 </p>
