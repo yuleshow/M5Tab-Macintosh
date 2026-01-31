@@ -261,6 +261,7 @@ Then format it during Mac OS installation.
 Download the latest release from GitHub:
 
 **[📥 Download Latest Release](https://github.com/amcchord/M5Tab-Macintosh/releases/latest)**
+(by Yule Show **[📥 Download Workable and Tested Latest Release](https://github.com/yuleshow/M5Tab-Macintosh/releases/latest)**)
 
 Flash the single merged binary using `esptool.py`:
 
